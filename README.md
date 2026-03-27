@@ -1,6 +1,9 @@
 # Agentic DNS-LLM
 
 A robust client-server architecture in Go that enables secure, agentic interaction with Large Language Models (Gemini) using the DNS protocol (DNS-over-TLS).
+<img width="1084" height="729" alt="Screenshot 2026-03-27 at 6 56 25 AM" src="https://github.com/user-attachments/assets/207f56e9-5933-4e6f-ae07-cf834889e046" />
+
+
 
 ## Features
 - **DNS Tunneling**: Custom stateful DNS tunneling protocol that uses optimized encoding to bypass DNS query size limits.
