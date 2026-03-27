@@ -1,0 +1,17 @@
+.env
+*.pem
+mise.toml
+
+# Go Binaries
+client_bin
+server_bin
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Go vendor
+vendor/
