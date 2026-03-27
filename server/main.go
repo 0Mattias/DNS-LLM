@@ -7,7 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -417,6 +420,24 @@ func markFailed(sess *Session, msgID int) {
 	mu.Unlock()
 }
 
+func (rw *dohResponseWriter) LocalAddr() net.Addr { return rw.localAddr }
+func (rw *dohResponseWriter) RemoteAddr() net.Addr { return rw.remoteAddr }
+func (rw *dohResponseWriter) WriteMsg(m *dns.Msg) error {
+	rw.msg = m
+	return nil
+}
+func (rw *dohResponseWriter) Write(b []byte) (int, error) { return 0, fmt.Errorf("not implemented") }
+func (rw *dohResponseWriter) Close() error { return nil }
+func (rw *dohResponseWriter) TsigStatus() error { return nil }
+func (rw *dohResponseWriter) TsigTimersOnly(b bool) {}
+func (rw *dohResponseWriter) Hijack() {}
+
+type dohResponseWriter struct {
+	localAddr  net.Addr
+	remoteAddr net.Addr
+	msg        *dns.Msg
+}
+
 func main() {
 	godotenv.Load("../.env") // Assuming server is run from server/ or project root
 	godotenv.Load(".env")
@@ -433,12 +454,16 @@ func main() {
 	mux.HandleFunc("llm.local.", handleQuery)
 
 	useDoT := os.Getenv("USE_DOT") == "true"
+	useDoH := os.Getenv("USE_DOH") == "true"
 	port := 53535
 	netType := "udp"
 	
 	if useDoT {
 		port = 853
 		netType = "tcp-tls"
+	} else if useDoH {
+		port = 443
+		netType = "https"
 	}
 	
 	if envPort := os.Getenv("SERVER_PORT"); envPort != "" {
@@ -447,19 +472,14 @@ func main() {
 		}
 	}
 	
-	// Bind to 0.0.0.0 if using DoT to support Google Cloud / external access. Support local fallback if UDP.
+	// Bind to 0.0.0.0 if using DoT/DoH to support Google Cloud / external access. Support local fallback if UDP.
 	serverAddr := fmt.Sprintf("0.0.0.0:%d", port)
-	if !useDoT {
+	if !(useDoT || useDoH) {
 		serverAddr = fmt.Sprintf("127.0.0.1:%d", port)
 	}
 
-	server := &dns.Server{
-		Addr:    serverAddr,
-		Net:     netType,
-		Handler: mux,
-	}
-
-	if useDoT {
+	var cert tls.Certificate
+	if useDoT || useDoH {
 		certPath := os.Getenv("TLS_CERT")
 		keyPath := os.Getenv("TLS_KEY")
 		if certPath == "" || keyPath == "" {
@@ -474,24 +494,129 @@ func main() {
 			}
 		}
 		
-		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-		if err != nil {
-			log.Fatalf("Failed to load TLS certificates (%s, %s): %s", certPath, keyPath, err)
-		}
-		
-		server.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
+		var tlsErr error
+		cert, tlsErr = tls.LoadX509KeyPair(certPath, keyPath)
+		if tlsErr != nil {
+			log.Fatalf("Failed to load TLS certificates (%s, %s): %s", certPath, keyPath, tlsErr)
 		}
 	}
 
 	log.Infof("Starting Agentic LLM DNS server on %s (Net: %s) ...", serverAddr, netType)
-	server.NotifyStartedFunc = func() {
-		log.Info("Server successfully started! Ready for queries.", "addr", serverAddr, "net", netType)
-	}
 
-	err := server.ListenAndServe()
-	if err != nil {
-		log.Fatalf("Failed to start server: %s", err)
+	if useDoH {
+		http.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost && r.Method != http.MethodGet {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+
+			var msgData []byte
+			var err error
+
+			if r.Method == http.MethodPost {
+				if r.Header.Get("Content-Type") != "application/dns-message" {
+					http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+					return
+				}
+				msgData, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 65536))
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+			} else if r.Method == http.MethodGet {
+				dnsParam := r.URL.Query().Get("dns")
+				if dnsParam == "" {
+					http.Error(w, "Missing dns parameter", http.StatusBadRequest)
+					return
+				}
+				msgData, err = base64.RawURLEncoding.DecodeString(dnsParam)
+				if err != nil {
+					msgData, err = base64.URLEncoding.DecodeString(dnsParam)
+					if err != nil {
+						http.Error(w, "Invalid dns parameter", http.StatusBadRequest)
+						return
+					}
+				}
+			}
+
+			msg := new(dns.Msg)
+			if err := msg.Unpack(msgData); err != nil {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+
+			var remoteAddr net.Addr
+			if tcpAddr, err := net.ResolveTCPAddr("tcp", r.RemoteAddr); err == nil {
+				remoteAddr = tcpAddr
+			} else {
+				remoteAddr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+			}
+
+			localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+			if !ok {
+				localAddr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443}
+			}
+
+			rw := &dohResponseWriter{
+				localAddr:  localAddr,
+				remoteAddr: remoteAddr,
+			}
+
+			mux.ServeDNS(rw, msg)
+
+			if rw.msg == nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			respBytes, err := rw.msg.Pack()
+			if err != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/dns-message")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			w.Write(respBytes)
+		})
+
+		httpServer := &http.Server{
+			Addr: serverAddr,
+			TLSConfig: &tls.Config{
+				Certificates: []tls.Certificate{cert},
+			},
+		}
+
+		log.Info("Server successfully started! Ready for DoH queries.", "addr", serverAddr, "net", netType)
+		err := httpServer.ListenAndServeTLS("", "")
+		if err != nil {
+			if strings.Contains(err.Error(), "permission denied") {
+				log.Fatalf("Failed to start DoH server on port %d. This requires root! Did you run with sudo? Error: %v", port, err)
+			}
+			log.Fatalf("Failed to start server on %s: %s", serverAddr, err)
+		}
+	} else {
+		server := &dns.Server{
+			Addr:    serverAddr,
+			Net:     netType,
+			Handler: mux,
+		}
+
+		if useDoT {
+			server.TLSConfig = &tls.Config{
+				Certificates: []tls.Certificate{cert},
+			}
+		}
+
+		server.NotifyStartedFunc = func() {
+			log.Info("Server successfully started! Ready for queries.", "addr", serverAddr, "net", netType)
+		}
+
+		err := server.ListenAndServe()
+		if err != nil {
+			log.Fatalf("Failed to start server: %s", err)
+		}
 	}
 }
 

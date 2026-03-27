@@ -7,6 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"bytes"
 	"os"
 	"os/exec"
 	"strings"
@@ -25,6 +28,7 @@ var (
 	serverAddr         = "127.0.0.1:53535"
 	domain             = "llm.local."
 	useDoT             = false
+	useDoH             = false
 	insecureSkipVerify = false
 )
 
@@ -55,6 +59,11 @@ func main() {
 		useDoT = true
 		if os.Getenv("DNS_SERVER_ADDR") == "" {
 			serverAddr = "127.0.0.1:853" // Default to DoT port
+		}
+	} else if os.Getenv("USE_DOH") == "true" {
+		useDoH = true
+		if os.Getenv("DNS_SERVER_ADDR") == "" {
+			serverAddr = "https://127.0.0.1/dns-query" // Default DoH endpoint
 		}
 	}
 	if os.Getenv("INSECURE_SKIP_VERIFY") == "true" {
@@ -88,24 +97,10 @@ func main() {
 	fmt.Println()
 	systemColor.Println("──────────────────────────────────────────────────────────────────")
 
-	// Init Session
-	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
-	s.Suffix = " " + color.HiBlackString("Initializing Agent Session...")
-	s.Color("magenta")
-	s.Start()
+	initSession(true)
 
-	id, err := doDNSQuery("init." + domain)
-	if err != nil {
-		s.Stop()
-		color.Red("Failed to initialize session: %v\n", err)
-		os.Exit(1)
-	}
-	sessionID = strings.TrimSpace(id)
-	msgID = 0
-	
-	s.Stop()
-	systemColor.Printf("Session ID established: %s\n", sessionID)
 	systemColor.Println("Type your message below. Press Enter to send, or Ctrl+C to exit.")
+	systemColor.Println("Type /help for a list of commands.")
 	systemColor.Println("Ready for input.")
 	fmt.Println()
 
@@ -128,8 +123,30 @@ func main() {
 		}
 		
 		text := scanner.Text()
-		if strings.TrimSpace(text) == "" {
+		cmdText := strings.TrimSpace(text)
+		if cmdText == "" {
 			continue
+		}
+
+		if cmdText == "/exit" || cmdText == "/quit" {
+			color.HiBlack("\nExiting session. Goodbye!\n")
+			break
+		} else if cmdText == "/clear" || cmdText == "/new" || cmdText == "/reset" {
+			fmt.Println()
+			color.HiCyan("Starting a new session...\n")
+			initSession(true)
+			continue
+		} else if cmdText == "/help" {
+			printHelp()
+			continue
+		} else if strings.HasPrefix(cmdText, "/compact") {
+			focus := strings.TrimSpace(strings.TrimPrefix(cmdText, "/compact"))
+			if focus == "" {
+				text = "SYSTEM COMMAND: Please summarize our conversation so far, keeping all important facts and context, then acknowledge you have compacted your memory to save space."
+			} else {
+				text = fmt.Sprintf("SYSTEM COMMAND: Please summarize our conversation so far, keeping all important context. Acknowledge you have compacted your memory. For all future responses, please focus strictly on: %s", focus)
+			}
+			color.HiMagenta("\n[Sending compact instruction to Agent...]\n")
 		}
 
 		payload := PayloadUP{
@@ -145,9 +162,46 @@ func main() {
 	}
 }
 
+func initSession(showInitMsg bool) {
+	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+	s.Suffix = " " + color.HiBlackString("Initializing Agent Session...")
+	s.Color("magenta")
+	s.Start()
+
+	id, err := doDNSQuery("init." + domain)
+	if err != nil {
+		s.Stop()
+		color.Red("Failed to initialize session: %v\n", err)
+		os.Exit(1)
+	}
+	sessionID = strings.TrimSpace(id)
+	msgID = 0
+	
+	s.Stop()
+	if showInitMsg {
+		color.New(color.FgHiBlack).Printf("Session ID established: %s\n", sessionID)
+	}
+}
+
+func printHelp() {
+	fmt.Println()
+	helpStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#F39C12")).Bold(true)
+	fmt.Println(helpStyle.Render("Available Commands:"))
+	fmt.Println("  /help                     - Show this help message")
+	fmt.Println("  /clear, /new, /reset      - Start a new chat session")
+	fmt.Println("  /exit, /quit              - Exit the application")
+	fmt.Println("  /compact [instructions]   - Ask the LLM to summarize and compact context")
+	fmt.Println()
+}
+
 func doDNSQuery(qname string) (string, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(qname, dns.TypeTXT)
+	
+	if useDoH {
+		return doDoHQuery(m)
+	}
+
 	c := new(dns.Client)
 	c.Net = "udp"
 	
@@ -160,6 +214,58 @@ func doDNSQuery(qname string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if r.Rcode != dns.RcodeSuccess {
+		return "", fmt.Errorf("DNS query failed: %v", dns.RcodeToString[r.Rcode])
+	}
+	if len(r.Answer) == 0 {
+		return "", fmt.Errorf("No TXT record found")
+	}
+	if txt, ok := r.Answer[0].(*dns.TXT); ok {
+		return strings.Join(txt.Txt, ""), nil
+	}
+	return "", fmt.Errorf("Answer is not a TXT record")
+}
+
+func doDoHQuery(m *dns.Msg) (string, error) {
+	msgData, err := m.Pack()
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, serverAddr, bytes.NewReader(msgData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("DoH request failed with status: %d", resp.StatusCode)
+	}
+
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	r := new(dns.Msg)
+	if err := r.Unpack(respData); err != nil {
+		return "", err
+	}
+
 	if r.Rcode != dns.RcodeSuccess {
 		return "", fmt.Errorf("DNS query failed: %v", dns.RcodeToString[r.Rcode])
 	}
