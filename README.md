@@ -1,4 +1,7 @@
-# Agentic DNS-LLM
+# Agentic DNS-LLM [🚨RETIRED🚨]
+
+# [NEW VERSION HERE](https://github.com/0Mattias/DNS-CLAW)
+
 
 A robust client-server architecture in Go that enables secure, agentic interaction with Large Language Models (ie. Gemini) using the DNS protocol (DNS-over-TLS).
 <img width="1084" height="729" alt="Screenshot 2026-03-27 at 6 56 25 AM" src="https://github.com/user-attachments/assets/207f56e9-5933-4e6f-ae07-cf834889e046" />
